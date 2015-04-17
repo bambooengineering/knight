@@ -1,0 +1,85 @@
+#!/bin/bash
+# The options
+PID_FILE=${1:-/var/run/haproxy.pid}
+PID_FILE_MV=${PID_FILE}.$$
+MAX_ATTEMPTS=15
+HAPROXY=/usr/local/bin/haproxy
+CONFIG=/etc/haproxy.cfg
+
+# Log with PID for multiple simultaenous reloads
+function log(){
+  echo "$$:""$@"
+}
+
+# Report error on correct line
+error() {
+  local parent_lineno="$1"
+  local message="$2"
+  local code="${3:-1}"
+  if [[ -n "$message" ]] ; then
+    log "Error on line ${parent_lineno}: ${message}; code ${code}"
+  else
+    log "Error on line ${parent_lineno}; code ${code}"
+  fi
+  exit $code
+}
+
+# Report subcmd results prepended with process
+function logcmd(){
+  log "$@"
+  "$@" 2>&1 | while read line; do log $line; done
+  RET=${PIPESTATUS[0]}
+  log "Returned $RET"
+  return $RET
+}
+
+# Always move the pid file back at exit. Just in case something dodgy happens
+function restorePidFile() {
+  trap - EXIT
+  logcmd mv -vu $PID_FILE_MV $PID_FILE
+}
+
+trap 'error ${LINENO}' ERR
+# Attempt an atomic (mv is atomic within a filesystem) move of the pid
+# file. This serves to take effective ownership of the reload process. A
+# reload only proceeds if the move is successful. If the move fails, we
+# sleep and then retry
+
+attempts=0
+log "Checking that we can reload"
+logcmd $HAPROXY -c -f $CONFIG
+
+
+while [ $attempts -lt $MAX_ATTEMPTS ]
+do
+  trap restorePidFile EXIT
+  trap - ERR
+  logcmd mv -fv $PID_FILE $PID_FILE_MV
+  MOVE_RESULT=$?
+  trap 'error ${LINENO}' ERR
+  if [ $MOVE_RESULT == 0 ]
+  then
+    if [ $attempts -gt 0 ]; then
+      log "Atomic move successful after $attempts" iterations
+    fi
+    mapfile < $PID_FILE_MV PID_CONTENT
+    if [[ ${PID_CONTENT[0]} =~ ^[0-9]+[^0-9]$ ]]; then 
+      PID="${PID_CONTENT%"${PID_CONTENT##*[![:space:]]}"}"
+      log "Reloading $PID"
+      logcmd $HAPROXY -f $CONFIG -p $PID_FILE_MV -sf $PID
+      restorePidFile
+      log "Successful reload!"
+      break
+    else
+      log "Could not read pid from $PID_FILE_MV (read '$PID')"
+      restorePidFile
+    fi
+  else
+    log "Another process is reloading. Waiting a bit..."
+    sleep 0.2
+  fi
+  attempts=$((attempts + 1))
+done
+if [ $attempts -ge $MAX_ATTEMPTS ]; then
+  log "Could not perform reload!!"
+fi
